@@ -14,23 +14,72 @@ struct Opts {
     sbanken_customer_id: Secret<String>,
     #[structopt(long, env)]
     sbanken_auth_url: String,
+    #[structopt(long, env)]
+    sbanken_base_url: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let opt = Opts::from_args();
 
-    let auth_token = get_auth_token(
+    let client = authorized_client(
         &opt.sbanken_auth_url,
         &opt.sbanken_client_id,
         &opt.sbanken_client_secret,
+        &opt.sbanken_customer_id,
     )
     .await
-    .context("unable to get auth token")?;
+    .context("unable to create authorized client")?;
 
-    dbg!(auth_token);
+    // Make a "random" call to an API to test authorization
+    let x: serde_json::Value = client
+        .get(&format!(
+            "{}/exec.customers/api/v1/Customers",
+            opt.sbanken_base_url
+        ))
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    dbg!(x);
 
     Ok(())
+}
+
+async fn authorized_client(
+    auth_url: &str,
+    client_id: &Secret<String>,
+    client_secret: &Secret<String>,
+    customer_id: &Secret<String>,
+) -> Result<reqwest::Client> {
+    let auth_token = get_auth_token(&auth_url, &client_id, &client_secret)
+        .await
+        .context("unable to get auth token")?;
+
+    // Create a client with pre-configured headers needed for all API calls
+    let headers = {
+        use reqwest::header::*;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            format!("Bearer {}", auth_token.expose_secret())
+                .parse()
+                .context("fetched auth_token contains invalid characters")?,
+        );
+        headers.insert(
+            "customerId",
+            customer_id.expose_secret().parse().expect(
+                "unreachable: customer_id should not contain non-visible ascii characters",
+            ),
+        );
+        headers
+    };
+
+    Ok(reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .context("unable to build http client")?)
 }
 
 async fn get_auth_token(
