@@ -1,0 +1,17 @@
+[package]
+name = "sbanken-firefly-bridge"
+version = "0.1.0"
+authors = ["Ole Martin Ruud <barskern@outlook.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "0.2", features = ["macros"] }
+reqwest = { version = "0.10", features = ["json"] }
+structopt = "0.3.7"
+# secrecy = "0.6.0"
+secrecy = { git = "https://github.com/barskern/crates.git", branch = "use-infallible", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+percent-encoding = "2.1.0"
