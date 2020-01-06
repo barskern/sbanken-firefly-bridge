@@ -64,27 +64,19 @@ async fn main() -> Result<()> {
         .context("unable to get existing accounts")?;
 
     for raw_account in accounts_response.items.into_iter().filter(|acc| {
-        existing_accounts_response
-            .data
-            .as_ref()
-            .map(|existing_accounts| {
-                !existing_accounts.iter().any(|account_read| {
-                    account_read
-                        .attributes
-                        .as_ref()
-                        .map(|account| {
-                            account
-                                .notes
-                                .as_ref()
-                                .map(|notes| notes == &acc.account_id)
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(true)
+        !existing_accounts_response.data.iter().any(|account_read| {
+            account_read
+                .attributes
+                .notes
+                .as_ref()
+                .map(|notes| notes == &acc.account_id)
+                .unwrap_or(false)
+        })
     }) {
-        eprintln!("Account '{}' does not already exist, creating...", raw_account.name);
+        eprintln!(
+            "Account '{}' does not already exist, creating...",
+            raw_account.name
+        );
         firefly_client
             .accounts_api()
             .store_account(raw_account.into())
