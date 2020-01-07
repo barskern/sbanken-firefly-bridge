@@ -16,6 +16,8 @@ serde = { version = "1", features = ["derive"] }
 anyhow = "1"
 percent-encoding = "2.1.0"
 serde_json = "1.0.44"
-firefly-iii = "0.1.0-alpha.5"
+firefly-iii = "0.1.0-alpha.6"
 # firefly-iii = { path = "../firefly-iii/out/firefly-iii-0.10.4/" }
 chrono = "0.4.10"
+# sbanken = { path = "../sbanken/out/sbanken/" }
+sbanken = "0.0.1-alpha.1"
