@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
         );
         firefly_client
             .accounts_api()
-            .store_account(convert_account(sbanken_account))
+            .store_account(convert_account(sbanken_account).context("unable to convert account")?)
             .await
             .context("unable to store account")?;
     }
@@ -135,17 +135,24 @@ async fn get_auth_token(
     }
 }
 
-fn convert_account(sbanken_account: sbanken::models::AccountV1) -> firefly_iii::models::Account {
+fn convert_account(
+    sbanken_account: sbanken::models::AccountV1,
+) -> Result<firefly_iii::models::Account> {
     use firefly_iii::models::account::*;
     let (_type, role_opt) = match &**sbanken_account.account_type.as_ref().unwrap() {
         "High interest account" => (Type::Asset, Some(AccountRole::SavingAsset)),
         "Standard account" => (Type::Expense, None),
         "BSU account" => (Type::Asset, Some(AccountRole::SavingAsset)),
-        _ => todo!("account type '{}'", sbanken_account.account_type.unwrap()),
+        _ => {
+            return Err(anyhow!(
+                "conversion not implemented for account type '{}'",
+                sbanken_account.account_type.unwrap()
+            ))
+        }
     };
     let mut firefly_account = Account::new(sbanken_account.name.unwrap(), _type);
     firefly_account.account_role = role_opt;
     firefly_account.account_number = Some(sbanken_account.account_number.unwrap());
     firefly_account.notes = Some(sbanken_account.account_id.unwrap());
-    firefly_account
+    Ok(firefly_account)
 }
