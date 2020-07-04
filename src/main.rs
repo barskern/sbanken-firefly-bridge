@@ -103,82 +103,89 @@ async fn main() -> Result<()> {
         .await
         .context("unable to get existing accounts")?;
 
-    // Loop through all transactions for all accounts and add them to firefly
-    for sbanken_account in sbanken_accounts.iter() {
-        let account_id = if let Some(account_id) = sbanken_account.account_id.as_ref() {
-            account_id
-        } else {
+    // Do one year at a time
+    for year in &["2019", "2020"] {
+        // Loop through all transactions for all accounts and add them to firefly
+        for sbanken_account in sbanken_accounts.iter() {
+            let account_id = if let Some(account_id) = sbanken_account.account_id.as_ref() {
+                account_id
+            } else {
+                eprintln!(
+                    "Unable to find matching firefly account for '{}', skipping",
+                    sbanken_account.name.as_ref().unwrap()
+                );
+                continue;
+            };
+
+            let sbanken_transactions = sbanken_client
+                .transactions_api()
+                .get_transactions(
+                    &account_id,
+                    Some(&opt.sbanken_customer_id.expose_secret()),
+                    Some(format!("{}-01-01", year)),
+                    if *year == "2020" {
+                        None
+                    } else {
+                        Some(format!("{}-12-31", year))
+                    },
+                    None,
+                    Some(1000),
+                )
+                .await
+                .context("unable to get transactions for account")?;
+
+            if sbanken_transactions.is_error.unwrap_or(true) {
+                eprintln!(
+                    "Error when accessing transaction, skipping: {}",
+                    sbanken_transactions.error_message.as_ref().unwrap()
+                );
+                continue;
+            }
+
             eprintln!(
-                "Unable to find matching firefly account for '{}', skipping",
+                "Found {} transaction(s) for account {}",
+                sbanken_transactions.available_items.unwrap(),
                 sbanken_account.name.as_ref().unwrap()
             );
-            continue;
-        };
 
-        let sbanken_transactions = sbanken_client
-            .transactions_api()
-            .get_transactions(
-                &account_id,
-                Some(&opt.sbanken_customer_id.expose_secret()),
-                Some("2020-01-01".into()),
-                None,
-                None,
-                Some(1000),
-            )
-            .await
-            .context("unable to get transactions for account")?;
+            if let Some(firefly_account) = firefly_accounts.data.iter().find(|account_read| {
+                account_read
+                    .attributes
+                    .notes
+                    .as_ref()
+                    .map(|notes| notes == account_id)
+                    .unwrap_or(false)
+            }) {
+                eprintln!("Updating transactions...");
 
-        if sbanken_transactions.is_error.unwrap_or(true) {
-            eprintln!(
-                "Error when accessing transaction, skipping: {}",
-                sbanken_transactions.error_message.as_ref().unwrap()
-            );
-            continue;
-        }
+                for sbanken_transaction in sbanken_transactions.items.unwrap() {
+                    let firefly_transaction =
+                        convert_transaction(&firefly_account, &sbanken_transaction)
+                            .context("unable to convert transaction")?;
 
-        eprintln!(
-            "Found {} transaction(s) for account {}",
-            sbanken_transactions.available_items.unwrap(),
-            sbanken_account.name.as_ref().unwrap()
-        );
+                    let t = &firefly_transaction.transactions[0];
+                    eprintln!(
+                        "{}: {} -- {} --> {}",
+                        t.date,
+                        t.source_id
+                            .map(|id| format!("<account {}>", id))
+                            .or(t.source_name.clone())
+                            .unwrap_or("<missing>".into()),
+                        t.amount,
+                        t.destination_id
+                            .map(|id| format!("<account {}>", id))
+                            .or(t.destination_name.clone())
+                            .unwrap_or("<missing>".into()),
+                    );
 
-        if let Some(firefly_account) = firefly_accounts.data.iter().find(|account_read| {
-            account_read
-                .attributes
-                .notes
-                .as_ref()
-                .map(|notes| notes == account_id)
-                .unwrap_or(false)
-        }) {
-            eprintln!("Updating transactions...");
-
-            for sbanken_transaction in sbanken_transactions.items.unwrap() {
-                let firefly_transaction =
-                    convert_transaction(&firefly_account, &sbanken_transaction)
-                        .context("unable to convert transaction")?;
-
-                let t = &firefly_transaction.transactions[0];
-                eprintln!(
-                    "{}: {} -- {} --> {}",
-                    t.date,
-                    t.source_id
-                        .map(|id| format!("<account {}>", id))
-                        .or(t.source_name.clone())
-                        .unwrap_or("<missing>".into()),
-                    t.amount,
-                    t.destination_id
-                        .map(|id| format!("<account {}>", id))
-                        .or(t.destination_name.clone())
-                        .unwrap_or("<missing>".into()),
-                );
-
-                let _ = firefly_client
-                    .transactions_api()
-                    .store_transaction(firefly_transaction.clone())
-                    .await
-                    .map_err(|e| {
-                        eprintln!("\tunable to store transaction, skipping: {}", e);
-                    });
+                    let _ = firefly_client
+                        .transactions_api()
+                        .store_transaction(firefly_transaction.clone())
+                        .await
+                        .map_err(|e| {
+                            eprintln!("\tunable to store transaction, skipping: {}", e);
+                        });
+                }
             }
         }
     }
