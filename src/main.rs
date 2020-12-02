@@ -2,7 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use firefly_iii::apis::{
     client::APIClient as FireflyClient, configuration::Configuration as FireflyConfiguration,
 };
+use lazy_static::lazy_static;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use regex::Regex;
 use sbanken::apis::{
     client::APIClient as SbankenClient, configuration::Configuration as SbankenConfiguration,
 };
@@ -105,17 +107,12 @@ async fn main() -> Result<()> {
 
     // Do one year at a time
     for year in &["2019", "2020"] {
+        // Collect all transactions which need to be deduplicated, for each account in this vector
+        let mut needs_deduplication = Vec::new();
+
         // Loop through all transactions for all accounts and add them to firefly
         for sbanken_account in sbanken_accounts.iter() {
-            let account_id = if let Some(account_id) = sbanken_account.account_id.as_ref() {
-                account_id
-            } else {
-                eprintln!(
-                    "Unable to find matching firefly account for '{}', skipping",
-                    sbanken_account.name.as_ref().unwrap()
-                );
-                continue;
-            };
+            let account_id = sbanken_account.account_id.as_ref().unwrap();
 
             let sbanken_transactions = sbanken_client
                 .transactions_api()
@@ -124,7 +121,11 @@ async fn main() -> Result<()> {
                     Some(&opt.sbanken_customer_id.expose_secret()),
                     Some(format!("{}-01-01", year)),
                     if *year == "2020" {
-                        None
+                        Some(
+                            (chrono::Utc::today() - chrono::Duration::days(10)) // TODO make configurable
+                                .format("%Y-%m-%d")
+                                .to_string(),
+                        )
                     } else {
                         Some(format!("{}-12-31", year))
                     },
@@ -159,8 +160,16 @@ async fn main() -> Result<()> {
                 eprintln!("Updating transactions...");
 
                 for sbanken_transaction in sbanken_transactions.items.unwrap() {
+                    if sbanken_transaction.transaction_type.as_deref() == Some("OVFNETTB")
+                        || sbanken_transaction.transaction_type.as_deref() == Some("MOB.B.OVF")
+                    {
+                        // Transaction is an internal bank transfer and has to be deduplicated.
+                        needs_deduplication.push((account_id, sbanken_transaction));
+                        continue;
+                    }
+
                     let firefly_transaction =
-                        convert_transaction(&firefly_account, &sbanken_transaction)
+                        convert_transaction(&firefly_account, &sbanken_transaction, None)
                             .context("unable to convert transaction")?;
 
                     let t = &firefly_transaction.transactions[0];
@@ -188,14 +197,160 @@ async fn main() -> Result<()> {
                 }
             }
         }
+
+        needs_deduplication.sort_by(|(_, a), (_, b)| {
+            a.accounting_date
+                .cmp(&b.accounting_date)
+                .then_with(|| a.text.cmp(&b.text))
+                .then_with(|| {
+                    a.amount
+                        .unwrap()
+                        .abs()
+                        .partial_cmp(&b.amount.unwrap().abs())
+                        .unwrap()
+                })
+                .then_with(|| a.amount.unwrap().partial_cmp(&b.amount.unwrap()).unwrap())
+        });
+
+        // Find and fix identical transfers
+        let flats: Vec<_> = needs_deduplication
+            .windows(2)
+            .map(|win| (win[0].1.amount.unwrap(), win[1].1.amount.unwrap()))
+            .scan(0, |state, (prev, cur)| {
+                let diff = cur - prev;
+
+                if diff > 0.0 {
+                    // rising "edge"
+                    *state = 0;
+                    Some(0)
+                } else if diff < 0.0 {
+                    // falling "edge"
+                    let prev_state = *state;
+                    *state = 0;
+                    Some(prev_state)
+                } else {
+                    // flat
+                    *state += 1;
+                    Some(0)
+                }
+            })
+            .enumerate()
+            .filter(|&(_, flat_count)| flat_count > 0)
+            .collect();
+
+        for (last_index, amount) in flats {
+            let consecutive_duplicates = amount + 1;
+
+            let first_index = last_index - 2 * consecutive_duplicates + 1;
+
+            let shift_amount = if consecutive_duplicates % 2 == 1 {
+                consecutive_duplicates
+            } else {
+                consecutive_duplicates - 1
+            };
+
+            let shifts = consecutive_duplicates / 2;
+
+            for s in 0..shifts {
+                let i = first_index + 1 + 2 * s;
+                needs_deduplication.swap(i, i + shift_amount);
+            }
+        }
+
+        for pair in needs_deduplication.chunks(2) {
+            let (from_ac, from_trans) = &pair[0];
+            let (to_ac, to_trans) = &pair[1];
+
+            assert_eq!(from_trans.amount, to_trans.amount.map(|f| -f));
+            assert_eq!(from_trans.text, to_trans.text);
+            assert_eq!(from_trans.accounting_date, to_trans.accounting_date);
+
+            let from_account = firefly_accounts
+                .data
+                .iter()
+                .find(|account_read| {
+                    account_read
+                        .attributes
+                        .notes
+                        .as_ref()
+                        .map(|notes| notes == *from_ac)
+                        .unwrap_or(false)
+                })
+                .unwrap();
+
+            let to_account = firefly_accounts
+                .data
+                .iter()
+                .find(|account_read| {
+                    account_read
+                        .attributes
+                        .notes
+                        .as_ref()
+                        .map(|notes| notes == *to_ac)
+                        .unwrap_or(false)
+                })
+                .unwrap();
+
+            eprintln!(
+                "{} : {} -- {:6.2} --> {} : {}",
+                from_trans.accounting_date.as_ref().unwrap(),
+                from_account.attributes.name,
+                from_trans.amount.unwrap().abs(),
+                to_account.attributes.name,
+                from_trans.text.as_ref().unwrap(),
+            );
+
+            let firefly_transaction =
+                convert_transaction(&from_account, &from_trans, Some(&to_account))
+                    .context("unable to convert transaction")?;
+
+            let _ = firefly_client
+                .transactions_api()
+                .store_transaction(firefly_transaction.clone())
+                .await
+                .map_err(|e| {
+                    eprintln!("\tunable to store transaction, skipping: {}", e);
+                });
+        }
     }
 
     Ok(())
 }
 
+fn cleanup_description(desc: &str) -> String {
+    lazy_static! {
+        static ref START_DATE: Regex = Regex::new(r"^\d{2}\.\d{2}\s").unwrap();
+        static ref VISA_VARE_EXTRACT: Regex =
+            Regex::new(r"(?i)^\*\d{4}\s\d{2}\.\d{2}\s\w{3}\s\d+.\d{2}\s(.+?)\sKurs:\s\d+.\d+$")
+                .unwrap();
+        static ref PAY_DATE: Regex = Regex::new(r"Betalt:\s\d{2}\.\d{2}\.\d{2}$").unwrap();
+    }
+
+    // Remove leading date (e.g. "12.02 KIWI ...")
+    let desc = START_DATE.replace(desc, "");
+
+    // Remove trailing pay date (e.g. "KIWI ... Betalt: 12.03.20")
+    let desc = PAY_DATE.replace(&desc, "");
+
+    // Remove leading "Fra: " and "Til: "
+    let desc = desc.trim_start_matches("Til: ");
+    let desc = desc.trim_start_matches("Fra: ");
+
+    // Extract name of company from VISA_VARE description
+    // (e.g. "*6227 26.02 NOK 30.00 COCA-COLA ENTERPRISES NOR Kurs: 1.0000")
+    let desc = VISA_VARE_EXTRACT
+        .captures(&desc)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str())
+        .unwrap_or(&desc);
+
+    return desc.trim().to_string();
+}
+
 fn convert_transaction(
-    firefly_account: &firefly_iii::models::AccountRead,
+    main_account: &firefly_iii::models::AccountRead,
     sbanken_transaction: &sbanken::models::TransactionV1,
+    other_account: Option<&firefly_iii::models::AccountRead>,
 ) -> Result<firefly_iii::models::Transaction> {
     use firefly_iii::models::{
         transaction_split::Type as TransactionType, Transaction, TransactionSplit,
@@ -207,13 +362,7 @@ fn convert_transaction(
         // Extract date part of timestamp (YYYY-MM-DDTHH:MM:SS)
         sbanken_transaction.accounting_date.as_ref().unwrap()[0..10].into(),
         format!("{:.2}", amount.abs()),
-        sbanken_transaction
-            .text
-            .as_ref()
-            .unwrap()
-            .chars()
-            .filter(|c| c.is_ascii())
-            .collect(),
+        sbanken_transaction.text.as_ref().unwrap().clone(),
         None,
         None,
     );
@@ -221,17 +370,27 @@ fn convert_transaction(
     split.category_name = sbanken_transaction.transaction_type.clone();
 
     if amount < 0.0 {
-        split._type = Some(TransactionType::Withdrawal);
-        split.source_id = firefly_account.id.clone().parse().ok();
-        split.destination_name = sbanken_transaction.text.clone(); // TODO filter out dates
+        split.source_id = main_account.id.clone().parse().ok();
+        if let Some(to_account) = other_account {
+            split._type = Some(TransactionType::Transfer);
+            split.destination_id = to_account.id.clone().parse().ok();
+        } else {
+            split._type = Some(TransactionType::Withdrawal);
+            split.destination_name = sbanken_transaction.text.as_deref().map(cleanup_description);
+        }
     } else {
-        split._type = Some(TransactionType::Deposit);
-        split.destination_id = firefly_account.id.clone().parse().ok();
-        split.source_name = sbanken_transaction.text.clone(); // TODO filter out dates
+        split.destination_id = main_account.id.clone().parse().ok();
+        if let Some(to_account) = other_account {
+            split._type = Some(TransactionType::Transfer);
+            split.source_id = to_account.id.clone().parse().ok();
+        } else {
+            split._type = Some(TransactionType::Deposit);
+            split.source_name = sbanken_transaction.text.as_deref().map(cleanup_description);
+        }
     }
 
     let mut transaction = Transaction::new(vec![split]);
-    transaction.error_if_duplicate_hash = Some(true);
+    //transaction.error_if_duplicate_hash = Some(true);
 
     Ok(transaction)
 }
