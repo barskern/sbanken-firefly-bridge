@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use chrono::Datelike;
 use firefly_iii::apis::{
     client::APIClient as FireflyClient, configuration::Configuration as FireflyConfiguration,
 };
@@ -11,6 +12,8 @@ use sbanken::apis::{
 use secrecy::{ExposeSecret, Secret};
 use serde::Deserialize;
 use structopt::StructOpt;
+
+const DATE_FORMAT: &str = "%Y-%m-%d";
 
 #[derive(StructOpt, Debug)]
 #[structopt(about, author)]
@@ -27,8 +30,12 @@ struct Opts {
     sbanken_base_url: String,
     #[structopt(long, env)]
     firefly_base_url: String,
-    #[structopt(long, env)]
+    #[structopt(long, env, hide_env_values = true)]
     firefly_access_token: Secret<String>,
+    #[structopt(long, default_value = "10")]
+    delay_days: i64,
+    #[structopt(long, default_value = "2019")]
+    first_year: i32,
 }
 
 #[tokio::main]
@@ -94,7 +101,6 @@ async fn main() -> Result<()> {
             .context("unable to store account")?;
     }
 
-    // Update accounts after possibly creating new accounts
     let firefly_accounts = firefly_client
         .accounts_api()
         .list_account(
@@ -105,8 +111,32 @@ async fn main() -> Result<()> {
         .await
         .context("unable to get existing accounts")?;
 
+    let first_sync_day = std::fs::read("firefly_last_sync")
+        .ok()
+        .map(|s| {
+            std::str::from_utf8(&s)
+                .context("invalid encoding in firefly_last_sync")
+                .and_then(|s| {
+                    chrono::NaiveDate::parse_from_str(s, DATE_FORMAT)
+                        .context("invalid date in firefly_last_sync")
+                })
+        })
+        .transpose()?;
+
+    let last_sync_day = (chrono::Utc::today() - chrono::Duration::days(opt.delay_days)).naive_local();
+
+    if first_sync_day == Some(last_sync_day) {
+        eprintln!("Already updated everything until {}", last_sync_day);
+        return Ok(());
+    }
+
+    let actual_first_year = first_sync_day
+        .map(|day| day.year())
+        .unwrap_or(opt.first_year);
+    let actual_last_year = last_sync_day.year();
+
     // Do one year at a time
-    for year in &["2019", "2020"] {
+    for year in actual_first_year..=actual_last_year {
         // Collect all transactions which need to be deduplicated, for each account in this vector
         let mut needs_deduplication = Vec::new();
 
@@ -119,13 +149,17 @@ async fn main() -> Result<()> {
                 .get_transactions(
                     &account_id,
                     Some(&opt.sbanken_customer_id.expose_secret()),
-                    Some(format!("{}-01-01", year)),
-                    if *year == "2020" {
+                    if year == actual_first_year {
                         Some(
-                            (chrono::Utc::today() - chrono::Duration::days(10)) // TODO make configurable
-                                .format("%Y-%m-%d")
-                                .to_string(),
+                            first_sync_day
+                                .map(|day| day.format(DATE_FORMAT).to_string())
+                                .unwrap_or_else(|| format!("{}-01-01", year)),
                         )
+                    } else {
+                        Some(format!("{}-01-01", year))
+                    },
+                    if year == actual_last_year {
+                        Some(last_sync_day.format(DATE_FORMAT).to_string())
                     } else {
                         Some(format!("{}-12-31", year))
                     },
@@ -162,7 +196,17 @@ async fn main() -> Result<()> {
                 for sbanken_transaction in sbanken_transactions.items.unwrap() {
                     if sbanken_transaction.transaction_type.as_deref() == Some("OVFNETTB")
                         || sbanken_transaction.transaction_type.as_deref() == Some("MOB.B.OVF")
+                        || sbanken_transaction.transaction_type.as_deref() == Some("TILBAKEF.")
                     {
+                        eprintln!(
+                            "{} {}: {} -- {} -- {} **internal transaction for dedup**",
+                            &sbanken_transaction.accounting_date.as_deref().unwrap()[..10],
+                            sbanken_transaction.transaction_type.as_deref().unwrap(),
+                            &firefly_account.attributes.name,
+                            sbanken_transaction.amount.unwrap(),
+                            sbanken_transaction.text.as_deref().unwrap(),
+                        );
+
                         // Transaction is an internal bank transfer and has to be deduplicated.
                         needs_deduplication.push((account_id, sbanken_transaction));
                         continue;
@@ -174,8 +218,9 @@ async fn main() -> Result<()> {
 
                     let t = &firefly_transaction.transactions[0];
                     eprintln!(
-                        "{}: {} -- {} --> {}",
+                        "{} {}: {} -- {} --> {}",
                         t.date,
+                        sbanken_transaction.transaction_type.as_deref().unwrap(),
                         t.source_id
                             .map(|id| format!("<account {}>", id))
                             .or(t.source_name.clone())
@@ -199,20 +244,17 @@ async fn main() -> Result<()> {
         }
 
         needs_deduplication.sort_by(|(_, a), (_, b)| {
-            a.accounting_date
-                .cmp(&b.accounting_date)
+            a.amount
+                .unwrap()
+                .abs()
+                .partial_cmp(&b.amount.unwrap().abs())
+                .expect("unreachable: amount was NaN")
+                .then_with(|| a.accounting_date.cmp(&b.accounting_date))
                 .then_with(|| a.text.cmp(&b.text))
-                .then_with(|| {
-                    a.amount
-                        .unwrap()
-                        .abs()
-                        .partial_cmp(&b.amount.unwrap().abs())
-                        .unwrap()
-                })
                 .then_with(|| a.amount.unwrap().partial_cmp(&b.amount.unwrap()).unwrap())
         });
 
-        // Find and fix identical transfers
+        // Find and fix identical transfers which are sorted after eachother
         let flats: Vec<_> = needs_deduplication
             .windows(2)
             .map(|win| (win[0].1.amount.unwrap(), win[1].1.amount.unwrap()))
@@ -236,12 +278,12 @@ async fn main() -> Result<()> {
             })
             .enumerate()
             .filter(|&(_, flat_count)| flat_count > 0)
-            .collect();
+            .collect(); // We have to collect to be able modify needs_deduplication
 
         for (last_index, amount) in flats {
             let consecutive_duplicates = amount + 1;
 
-            let first_index = last_index - 2 * consecutive_duplicates + 1;
+            let first_index = (last_index + 1) - 2 * consecutive_duplicates;
 
             let shift_amount = if consecutive_duplicates % 2 == 1 {
                 consecutive_duplicates
@@ -257,13 +299,11 @@ async fn main() -> Result<()> {
             }
         }
 
-        for pair in needs_deduplication.chunks(2) {
+        // Run deduplication on this list, which is now exactly sorted so that sender and receiver are in the same pairs
+        let mut dedup_chunks = needs_deduplication.chunks_exact(2);
+        for pair in &mut dedup_chunks {
             let (from_ac, from_trans) = &pair[0];
             let (to_ac, to_trans) = &pair[1];
-
-            assert_eq!(from_trans.amount, to_trans.amount.map(|f| -f));
-            assert_eq!(from_trans.text, to_trans.text);
-            assert_eq!(from_trans.accounting_date, to_trans.accounting_date);
 
             let from_account = firefly_accounts
                 .data
@@ -292,27 +332,65 @@ async fn main() -> Result<()> {
                 .unwrap();
 
             eprintln!(
-                "{} : {} -- {:6.2} --> {} : {}",
+                "{} ({}) : {} -- {:6.2} ({:6.2}) --> {} : {} ({})",
+                from_trans.accounting_date.as_ref().unwrap(),
+                to_trans.accounting_date.as_ref().unwrap(),
+                from_account.attributes.name,
+                from_trans.amount.unwrap(),
+                to_trans.amount.unwrap(),
+                to_account.attributes.name,
+                from_trans.text.as_ref().unwrap(),
+                to_trans.text.as_ref().unwrap(),
+            );
+
+            if from_trans.amount == to_trans.amount.map(|f| -f)
+                && from_trans.text == to_trans.text
+                && from_trans.accounting_date == to_trans.accounting_date
+            {
+                let firefly_transaction =
+                    convert_transaction(&from_account, &from_trans, Some(&to_account))
+                        .context("unable to convert transaction")?;
+
+                let _ = firefly_client
+                    .transactions_api()
+                    .store_transaction(firefly_transaction.clone())
+                    .await
+                    .map_err(|e| {
+                        eprintln!("\tunable to store transaction, skipping: {}", e);
+                    });
+            } else {
+                eprintln!("\twarn: got unbalanced transaction (not equal amount/date/text), skipping")
+            }
+        }
+
+        if let Some((from_ac, from_trans)) = &dedup_chunks.remainder().first() {
+            let from_account = firefly_accounts
+                .data
+                .iter()
+                .find(|account_read| {
+                    account_read
+                        .attributes
+                        .notes
+                        .as_ref()
+                        .map(|notes| notes == *from_ac)
+                        .unwrap_or(false)
+                })
+                .unwrap();
+
+            eprintln!(
+                "GOT A LEFTOVER TRANSACTION: {} : {} -- {:6.2} -->  : {}",
                 from_trans.accounting_date.as_ref().unwrap(),
                 from_account.attributes.name,
                 from_trans.amount.unwrap().abs(),
-                to_account.attributes.name,
                 from_trans.text.as_ref().unwrap(),
             );
-
-            let firefly_transaction =
-                convert_transaction(&from_account, &from_trans, Some(&to_account))
-                    .context("unable to convert transaction")?;
-
-            let _ = firefly_client
-                .transactions_api()
-                .store_transaction(firefly_transaction.clone())
-                .await
-                .map_err(|e| {
-                    eprintln!("\tunable to store transaction, skipping: {}", e);
-                });
         }
     }
+
+    std::fs::write(
+        "firefly_last_sync",
+        &last_sync_day.format(DATE_FORMAT).to_string(),
+    )?;
 
     Ok(())
 }
@@ -389,10 +467,7 @@ fn convert_transaction(
         }
     }
 
-    let mut transaction = Transaction::new(vec![split]);
-    //transaction.error_if_duplicate_hash = Some(true);
-
-    Ok(transaction)
+    Ok(Transaction::new(vec![split]))
 }
 
 fn convert_account(
@@ -414,6 +489,7 @@ fn convert_account(
     firefly_account.account_role = Some(account_role);
     firefly_account.account_number = Some(sbanken_account.account_number.clone().unwrap());
     firefly_account.notes = Some(sbanken_account.account_id.clone().unwrap());
+
     Ok(firefly_account)
 }
 
