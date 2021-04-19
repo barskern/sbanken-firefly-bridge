@@ -422,6 +422,8 @@ fn cleanup_description(desc: &str) -> String {
         .map(|m| m.as_str())
         .unwrap_or(&desc);
 
+    let desc = if desc.starts_with("Skimore") { "Skimore" } else { desc };
+
     return desc.trim().to_string();
 }
 
