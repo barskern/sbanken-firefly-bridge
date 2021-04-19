@@ -422,7 +422,17 @@ fn cleanup_description(desc: &str) -> String {
         .map(|m| m.as_str())
         .unwrap_or(&desc);
 
-    let desc = if desc.starts_with("Skimore") { "Skimore" } else { desc };
+    let desc = if desc.to_lowercase().starts_with("skimore") { "Skimore" } else { desc };
+
+    let desc = if desc.to_lowercase().starts_with("starbucks") { "Starbucks" } else { desc };
+
+    let desc = if desc.to_lowercase().starts_with("steam") { "Steam" } else { desc };
+
+    let desc = if desc.to_lowercase().starts_with("domeneshop") { "Domeneshop" } else { desc };
+
+    let desc = if desc.to_lowercase().starts_with("hokksund sushi og thai") { "Hokksund Sushi og Thai" } else { desc };
+
+    let desc = if desc.to_lowercase().starts_with("tekna") { "TEKNA" } else { desc };
 
     return desc.trim().to_string();
 }
